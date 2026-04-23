@@ -23,6 +23,47 @@ do_notify() {
     fi
 }
 
+load_qubes_virtual_dns() {
+    if [ -r /var/run/qubes/qubes-ns ]; then
+        . /var/run/qubes/qubes-ns
+        return 0
+    fi
+
+    if command -v qubesdb-read >/dev/null 2>&1; then
+        NS1="$(qubesdb-read /qubes-netvm-primary-dns 2>/dev/null || true)"
+        NS2="$(qubesdb-read /qubes-netvm-secondary-dns 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$NS1" || -n "$NS2" ]]; then
+        return 0
+    fi
+
+    echo "Error: failed to determine Qubes virtual DNS addresses." >&2
+    return 1
+}
+
+is_ipv4_literal() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+filter_ipv4_dns() {
+    local dns
+    local filtered=()
+
+    for dns in $vpn_dns; do
+        if is_ipv4_literal "$dns"; then
+            filtered+=("$dns")
+        fi
+    done
+
+    if [[ ${#filtered[@]} -eq 0 ]]; then
+        echo "Error: no IPv4 VPN DNS servers were provided." >&2
+        return 1
+    fi
+
+    vpn_dns="${filtered[*]}"
+}
+
 
 case "$1" in
 up|test-up)
@@ -38,21 +79,46 @@ up|test-up)
 
 ;;&
 up)
+    nft flush chain ip qubes dnat-dns
     if [[ -n "$vpn_dns" ]] ; then
+        filter_ipv4_dns
         # Set DNS address translation in firewall:
         echo "$vpn_dns " >$nspath
         echo "Using DNS servers $vpn_dns"
-        iptables -t nat -F PR-QBS
-        . /var/run/qubes/qubes-ns
-        q_addr=""
+        load_qubes_virtual_dns
+
+        vpn_dns_ip4=()
         for DNS in $vpn_dns; do
-            iptables -t nat -I PR-QBS $q_addr -i vif+ -p tcp --dport 53 -j DNAT --to $DNS
-            iptables -t nat -I PR-QBS $q_addr -i vif+ -p udp --dport 53 -j DNAT --to $DNS
-            q_addr="-d $NS1"
+            vpn_dns_ip4+=("$DNS")
+        done
+
+        qubes_dns_ip4=()
+        for NS in $NS1 $NS2; do
+            if is_ipv4_literal "$NS"; then
+                qubes_dns_ip4+=("$NS")
+            fi
+        done
+
+        if [[ ${#qubes_dns_ip4[@]} -eq 0 ]]; then
+            echo "Error: Qubes did not provide any IPv4 virtual DNS addresses." >&2
+            do_notify "LINK BLOCKED, NO QUBES DNS!" "dialog-error"
+            exit 1
+        fi
+
+        for i in $(seq 0 $((${#qubes_dns_ip4[@]} - 1))); do
+            if [[ $i < ${#vpn_dns_ip4[@]} ]] ; then
+                nft add rule ip qubes dnat-dns iifgroup 2 ip daddr ${qubes_dns_ip4[$i]} tcp dport 53 dnat to ${vpn_dns_ip4[$i]}
+                nft add rule ip qubes dnat-dns iifgroup 2 ip daddr ${qubes_dns_ip4[$i]} udp dport 53 dnat to ${vpn_dns_ip4[$i]}
+            else
+                nft add rule ip qubes dnat-dns iifgroup 2 ip daddr ${qubes_dns_ip4[$i]} tcp dport 53 dnat to ${vpn_dns_ip4[0]}
+                nft add rule ip qubes dnat-dns iifgroup 2 ip daddr ${qubes_dns_ip4[$i]} udp dport 53 dnat to ${vpn_dns_ip4[0]}
+            fi
         done
         do_notify "LINK IS UP." "network-idle"
     else
-        do_notify "LINK UP, NO DNS!" "dialog-error"
+        echo "Error: VPN link came up without VPN DNS; refusing to continue in fail-closed mode." >&2
+        do_notify "LINK BLOCKED, NO DNS!" "dialog-error"
+        exit 1
     fi
 
 ;;
@@ -61,6 +127,7 @@ test-up)
 ##  Use test-up parameter to test your basic VPN link before enabling firewall script.
 ##  Do NOT use beyond testing period.
     if [[ -z "$vpn_dns" ]]; then echo "NO DNS ADDRESS FOUND."; exit 0; fi
+    filter_ipv4_dns
     [ -e /etc/resolv.vpnbak ] || cp -a /etc/resolv.conf /etc/resolv.vpnbak
     rm /etc/resolv.conf
     for DNS in $vpn_dns; do
@@ -71,7 +138,7 @@ test-up)
 
 ;;
 down)
-    iptables -t nat -F PR-QBS
+    nft flush chain ip qubes dnat-dns
     do_notify "LINK IS DOWN !" "dialog-error"
 
 ;;

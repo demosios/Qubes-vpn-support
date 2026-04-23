@@ -5,7 +5,9 @@
 
 remote vpn.example.com
 
-# Set static DNS IPs, separated by spaces:
+# If "remote" uses a hostname, set provider DNS here so the client resolves
+# the VPN endpoint against provider-controlled DNS instead of the system DNS.
+# Only IPv4 DNS is supported because IPv6 is disabled by this profile.
 #setenv vpn_dns "X.X.X.X Y.Y.Y.Y"
 
 client
@@ -20,4 +22,3 @@ remote-cert-tls server
 ca example.crt
 crl-verify example.pem
 persist-key
-

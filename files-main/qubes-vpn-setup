@@ -13,6 +13,277 @@ do_notify() {
     fi
 }
 
+detect_os() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        printf '%s\n' "${ID:-unknown}"
+    else
+        printf '%s\n' "unknown"
+    fi
+}
+
+pkg_is_installed() {
+    local os_id="$1"
+    local pkg="$2"
+
+    case "$os_id" in
+        debian)
+            dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -F "install ok installed" >/dev/null
+            ;;
+        fedora)
+            rpm -q "$pkg" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+report_missing_packages() {
+    local os_id="$1"
+    shift
+    local missing=()
+    local pkg
+
+    for pkg in "$@"; do
+        if ! pkg_is_installed "$os_id" "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    printf 'Missing packages: %s\n' "${missing[*]}"
+    case "$os_id" in
+        debian)
+            printf 'Install with: sudo apt-get install -y %s\n' "${missing[*]}"
+            ;;
+        fedora)
+            printf 'Install with: sudo dnf install -y %s\n' "${missing[*]}"
+            ;;
+    esac
+    return 1
+}
+
+check_dependencies() {
+    local os_id
+    local ok=0
+
+    os_id="$(detect_os)"
+    case "$os_id" in
+        debian)
+            echo "Detected Debian-based template."
+            report_missing_packages "$os_id" qubes-core-agent-networking nftables python3 xterm libnotify-bin || ok=1
+            report_missing_packages "$os_id" openvpn || ok=1
+            report_missing_packages "$os_id" wireguard-tools || ok=1
+            ;;
+        fedora)
+            echo "Detected Fedora-based template."
+            report_missing_packages "$os_id" qubes-core-agent-networking nftables python3 xterm libnotify openvpn wireguard-tools || ok=1
+            ;;
+        *)
+            echo "Unsupported OS for automatic package hints. Install at least: qubes-core-agent-networking nftables python3 xterm notify-send openvpn wireguard-tools" >&2
+            return 1
+            ;;
+    esac
+
+    if [ "$ok" -eq 0 ]; then
+        echo "Dependency check passed."
+        return 0
+    fi
+
+    return 1
+}
+
+print_config_staging_notes() {
+    cat <<'EOF'
+Next steps:
+1. Put your VPN configuration in /rw/config/vpn/vpn-client.conf.
+2. Add any provider certs/keys to /rw/config/vpn/.
+3. If the config uses username/password auth, run:
+   sudo /usr/lib/qubes/qubes-vpn-setup --userpass
+4. For strict hostname resolution, set VPN DNS inside the config:
+   OpenVPN: setenv vpn_dns "X.X.X.X Y.Y.Y.Y"
+   WireGuard: DNS = X.X.X.X, Y.Y.Y.Y
+5. Start or restart the service after the config exists:
+   sudo systemctl restart qubes-vpn-handler.service
+EOF
+}
+
+disable_ipv6_stack() {
+    local knob
+
+    for knob in /proc/sys/net/ipv6/conf/all/disable_ipv6 \
+        /proc/sys/net/ipv6/conf/default/disable_ipv6 \
+        /proc/sys/net/ipv6/conf/lo/disable_ipv6 \
+        /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [ -e "$knob" ] || continue
+        echo '1' > "$knob"
+    done
+}
+
+is_ipv4_literal() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6_literal() {
+    [[ "$1" == *:* ]]
+}
+
+config_vpn_dns() {
+    local line
+    local value=""
+
+    if [[ -n "$vpn_dns" ]]; then
+        value="$vpn_dns"
+    fi
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*setenv[[:space:]]+vpn_dns[[:space:]]+(.+)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*DNS[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+    done </tmp/vpn-client.conf
+
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+    value="${value//,/ }"
+    printf '%s\n' "$value"
+}
+
+resolve_remote_hostnames() {
+    local config_dns
+    local dns
+    local dns_servers=()
+    local backup=/tmp/resolv.conf.qvpn.bak
+    local resolv_tmp=/tmp/resolv.conf.qvpn.tmp
+    local config_tmp=/tmp/vpn-client.conf.resolved
+    local line stripped host resolved ip rest
+    local remote_found=0
+
+    config_dns="$(config_vpn_dns)"
+    for dns in $config_dns; do
+        if is_ipv4_literal "$dns"; then
+            dns_servers+=("$dns")
+        fi
+    done
+
+    cp -a /etc/resolv.conf "$backup"
+    : >"$resolv_tmp"
+    for dns in "${dns_servers[@]}"; do
+        printf 'nameserver %s\n' "$dns" >>"$resolv_tmp"
+    done
+
+    : >"$config_tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        stripped="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$stripped" =~ ^remote[[:space:]]+([^[:space:]]+)([[:space:]].*)?$ ]]; then
+            remote_found=1
+            host="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+
+            if is_ipv4_literal "$host"; then
+                printf '%s\n' "$line" >>"$config_tmp"
+                continue
+            fi
+
+            if is_ipv6_literal "$host"; then
+                echo "Error: IPv6 remote $host is incompatible with IPv6-disabled mode." >&2
+                cp -a "$backup" /etc/resolv.conf
+                rm -f "$backup" "$config_tmp" "$resolv_tmp"
+                return 1
+            fi
+
+            if [[ ! "$host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                echo "Error: unsupported remote hostname $host." >&2
+                cp -a "$backup" /etc/resolv.conf
+                rm -f "$backup" "$config_tmp" "$resolv_tmp"
+                return 1
+            fi
+
+            if [[ ${#dns_servers[@]} -eq 0 ]]; then
+                echo "Error: remote hostname $host requires IPv4 VPN DNS configured via setenv vpn_dns." >&2
+                cp -a "$backup" /etc/resolv.conf
+                rm -f "$backup" "$config_tmp" "$resolv_tmp"
+                return 1
+            fi
+
+            : >"$resolv_tmp"
+            for dns in "${dns_servers[@]}"; do
+                printf 'nameserver %s\n' "$dns" >>"$resolv_tmp"
+            done
+            mv "$resolv_tmp" /etc/resolv.conf
+            ip="$(getent ahostsv4 "$host" | awk 'NR == 1 { print $1; exit }')"
+            cp -a "$backup" /etc/resolv.conf
+            if [[ -z "$ip" ]]; then
+                echo "Error: failed to resolve $host using configured VPN DNS." >&2
+                rm -f "$backup" "$config_tmp"
+                return 1
+            fi
+
+            resolved="${line/$host/$ip}"
+            printf '%s\n' "$resolved" >>"$config_tmp"
+            continue
+        elif [[ "$stripped" =~ ^Endpoint[[:space:]]*=[[:space:]]*([^[:space:]:]+):([0-9]+)$ ]]; then
+            remote_found=1
+            host="${BASH_REMATCH[1]}"
+
+            if is_ipv4_literal "$host"; then
+                printf '%s\n' "$line" >>"$config_tmp"
+                continue
+            fi
+
+            if is_ipv6_literal "$host"; then
+                echo "Error: IPv6 WireGuard endpoint $host is incompatible with IPv6-disabled mode." >&2
+                cp -a "$backup" /etc/resolv.conf
+                rm -f "$backup" "$config_tmp" "$resolv_tmp"
+                return 1
+            fi
+
+            if [[ ${#dns_servers[@]} -eq 0 ]]; then
+                echo "Error: WireGuard endpoint hostname $host requires IPv4 VPN DNS configured via DNS=." >&2
+                cp -a "$backup" /etc/resolv.conf
+                rm -f "$backup" "$config_tmp" "$resolv_tmp"
+                return 1
+            fi
+
+            : >"$resolv_tmp"
+            for dns in "${dns_servers[@]}"; do
+                printf 'nameserver %s\n' "$dns" >>"$resolv_tmp"
+            done
+            mv "$resolv_tmp" /etc/resolv.conf
+            ip="$(getent ahostsv4 "$host" | awk 'NR == 1 { print $1; exit }')"
+            cp -a "$backup" /etc/resolv.conf
+            if [[ -z "$ip" ]]; then
+                echo "Error: failed to resolve WireGuard endpoint $host using configured VPN DNS." >&2
+                rm -f "$backup" "$config_tmp"
+                return 1
+            fi
+
+            resolved="${line/$host/$ip}"
+            printf '%s\n' "$resolved" >>"$config_tmp"
+            continue
+        fi
+
+        printf '%s\n' "$line" >>"$config_tmp"
+    done </tmp/vpn-client.conf
+
+    cp -a "$backup" /etc/resolv.conf
+    rm -f "$backup" "$resolv_tmp"
+
+    if [[ $remote_found -eq 1 ]]; then
+        mv "$config_tmp" /tmp/vpn-client.conf
+    else
+        rm -f "$config_tmp"
+    fi
+}
+
 
 # Need bash for password prompt
 do_userpass() {
@@ -49,14 +320,105 @@ firewall_link() {
     /rw/config/qubes-firewall.d/90_tunnel-restrict
 }
 
+reload_qubes_firewall() {
+    systemctl restart qubes-firewall.service
+}
+
+check_firewall_rules() {
+    python3 - <<'PY'
+import json
+import subprocess
+import sys
+
+
+def load_chain(family, chain):
+    out = subprocess.check_output(
+        ["nft", "-j", "list", "chain", family, "qubes", chain],
+        text=True,
+    )
+    return json.loads(out)["nftables"]
+
+
+def rules_of(items):
+    for item in items:
+        rule = item.get("rule")
+        if rule and "expr" in rule:
+            yield rule["expr"]
+
+
+def match_meta(expr, key, right):
+    return (
+        "match" in expr
+        and "meta" in expr["match"].get("left", {})
+        and expr["match"]["left"]["meta"].get("key") == key
+        and expr["match"].get("op") == "=="
+        and expr["match"].get("right") == right
+    )
+
+
+def has_verdict(exprs, verdict):
+    return any(verdict in expr for expr in exprs)
+
+
+def has_ct_est_related(exprs):
+    for expr in exprs:
+        match = expr.get("match")
+        if not match:
+            continue
+        left = match.get("left", {})
+        if left.get("ct", {}).get("key") != "state":
+            continue
+        right = match.get("right")
+        if isinstance(right, list) and "established" in right and "related" in right:
+            return True
+        if isinstance(right, str) and "established" in right and "related" in right:
+            return True
+    return False
+
+
+def has_skgid(exprs):
+    for expr in exprs:
+        match = expr.get("match")
+        if not match:
+            continue
+        left = match.get("left", {})
+        if left.get("meta", {}).get("key") == "skgid":
+            return True
+    return False
+
+
+def find_rule(expr_groups, predicate):
+    return any(predicate(exprs) for exprs in expr_groups)
+
+
+try:
+    ip_forward = list(rules_of(load_chain("ip", "custom-forward")))
+    ip6_forward = list(rules_of(load_chain("ip6", "custom-forward")))
+    ip_output = list(rules_of(load_chain("ip", "output")))
+except Exception:
+    sys.exit(1)
+
+
+checks = [
+    find_rule(ip_forward, lambda exprs: any(match_meta(e, "oifgroup", 1) for e in exprs) and has_verdict(exprs, "drop")),
+    find_rule(ip_forward, lambda exprs: any(match_meta(e, "iifgroup", 1) for e in exprs) and has_verdict(exprs, "drop")),
+    find_rule(ip_forward, lambda exprs: any(match_meta(e, "iifgroup", 2) for e in exprs) and any(match_meta(e, "oifgroup", 9) for e in exprs) and has_verdict(exprs, "accept")),
+    find_rule(ip_forward, lambda exprs: any(match_meta(e, "iifgroup", 9) for e in exprs) and any(match_meta(e, "oifgroup", 2) for e in exprs) and has_ct_est_related(exprs) and has_verdict(exprs, "accept")),
+    find_rule(ip6_forward, lambda exprs: has_verdict(exprs, "drop")),
+    find_rule(ip_output, lambda exprs: any(match_meta(e, "oifgroup", 1) for e in exprs) and has_skgid(exprs) and has_verdict(exprs, "accept")),
+]
+
+sys.exit(0 if all(checks) else 1)
+PY
+}
+
 
 case "$1" in
 --check-firewall)
+    disable_ipv6_stack
     for i in 1 2 3; do
-        if iptables -C FORWARD -o eth0 -j DROP \
-        && iptables -C FORWARD -i eth0 -j DROP  \
-        && ip6tables -C FORWARD -o eth0 -j DROP  \
-        && ip6tables -C FORWARD -i eth0 -j DROP ; then
+        if check_firewall_rules \
+        && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = "1" ]; then
             exit 0
         elif [ $i = 3 ]; then
             echo "Error: Firewall rule(s) not enabled!"
@@ -67,6 +429,12 @@ case "$1" in
 ;;
 
 --pre-start)
+    disable_ipv6_stack
+    if [ ! -f $qvpnpath/vpn-client.conf ]; then
+        echo "Error: missing $qvpnpath/vpn-client.conf" >&2
+        echo "Add the VPN config and restart qubes-vpn-handler.service." >&2
+        exit 1
+    fi
     if [ ! -f $qvpnpath/$upfile ] && [ ! -f $qvpnpath/no-$upfile ]; then
         if [ ! -f /tmp/qvpn-askpass ]; then
             systemd-run --unit=qvpn-askpass -E DISPLAY=:0 sh -c \
@@ -96,6 +464,7 @@ case "$1" in
     if [ -f $qvpnpath/no-$upfile ]; then
         userpassword_opt=""
     fi
+    resolve_remote_hostnames
     echo EXEC  $client_cmd $client_opt1 $client_opt2 $client_opt3 $client_opt4 \
       $client_opt5 $userpassword_opt
     eval $client_cmd $client_opt1 $client_opt2 $client_opt3 $client_opt4 \
@@ -103,23 +472,24 @@ case "$1" in
 ;;
 
 --post-start)
+    disable_ipv6_stack
     echo '1' > /proc/sys/net/ipv4/ip_forward
-# '0' appears to be default setting for ipv6
-#    echo '1' > /proc/sys/net/ipv6/conf/all/forwarding
+    echo '0' > /proc/sys/net/ipv6/conf/all/forwarding
     echo "STARTED network forwarding!"
 ;;
 
 --post-stop)
+    disable_ipv6_stack
     echo '0' > /proc/sys/net/ipv4/ip_forward
     echo '0' > /proc/sys/net/ipv6/conf/all/forwarding
     echo "STOPPED network forwarding!"
 ;;
 
 --install)
-
+    check_dependencies
     if [ ! -d vpn ]; then exit 1; fi
     chown -R root:root *
-    chmod +x rc.local qubes-vpn-ns qubes-vpn-setup proxy-firewall-restrict
+    chmod +x rc.local qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict
 
     if [ -e /var/run/qubes/this-is-templatevm ]; then
         echo "Install into templateVM..."
@@ -127,7 +497,7 @@ case "$1" in
         cp -a qubes-vpn-handler.service* /lib/systemd/system
         sync; sleep 2s; systemctl daemon-reload
         systemctl enable qubes-vpn-handler.service
-        cp -a qubes-vpn-ns qubes-vpn-setup proxy-firewall-restrict \
+        cp -a qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict \
     -t /usr/lib/qubes
         echo "Almost done..."
         echo "Next, shutdown this template then start proxyVM and run:"
@@ -136,12 +506,14 @@ case "$1" in
     elif [ -e /var/run/qubes/this-is-proxyvm ]; then
         echo -n "Isolated install for proxyVM..."
         cp -a vpn rc.local qubes-vpn-handler.* qubes-vpn-setup \
-          qubes-vpn-ns proxy-firewall-restrict -t /rw/config
+          qubes-vpn-ns qubes-vpn-openvpn-script proxy-firewall-restrict -t /rw/config
         firewall_link /rw/config
+        reload_qubes_firewall
         ln -s -f /rw/config/qubes-vpn-setup /usr/lib/qubes/qubes-vpn-setup
         ln -s -f /rw/config/qubes-vpn-ns /usr/lib/qubes/qubes-vpn-ns
+        ln -s -f /rw/config/qubes-vpn-openvpn-script /usr/lib/qubes/qubes-vpn-openvpn-script
         echo "copy complete."
-        do_userpass
+        print_config_staging_notes
         echo "Done!"
 
     else
@@ -159,14 +531,14 @@ case "$1" in
         rm -rf /lib/systemd/system/qubes-vpn-handler.service.d
         systemctl daemon-reload
         cd /usr/lib/qubes
-        rm -f qubes-vpn-ns qubes-vpn-setup proxy-firewall-restrict
+        rm -f qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict
         )
         echo qubes-vpn-handler removed.
     elif is_proxyvm ; then
         ( cd /rw/config
         rm -rf qubes-vpn-handler.service
         rm -rf qubes-vpn-handler.service.d
-        rm -f qubes-vpn-ns qubes-vpn-setup proxy-firewall-restrict
+        rm -f qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict
         mv -v rc.local rc.local-qvpn-disabled
         )
         echo qubes-vpn-handler removed.
@@ -178,7 +550,8 @@ case "$1" in
     if is_proxyvm ; then
         mkdir -p /rw/config/vpn
         firewall_link /usr/lib/qubes
-        do_userpass
+        reload_qubes_firewall
+        print_config_staging_notes
         echo "Done!"
     else
         echo "Error: Not a proxyVM. Check instructions."
@@ -189,6 +562,7 @@ case "$1" in
     . /usr/lib/qubes/init/functions
     if is_proxyvm ; then
         firewall_link /usr/lib/qubes
+        reload_qubes_firewall
         echo "Done!"
     else
         echo "Error: Not a proxyVM. Please check instructions."
@@ -201,9 +575,17 @@ case "$1" in
     do_userpass
 ;;
 
+--userpass)
+    mkdir -p $qvpnpath
+    do_userpass
+;;
+
+--check-deps)
+    check_dependencies
+;;
+
 --version)
     echo "1.4.4"
 ;;
 
 esac
-

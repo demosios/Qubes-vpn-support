@@ -1,202 +1,382 @@
 # Qubes-vpn-support
-Secure VPN VMs in [Qubes OS](https://www.qubes-os.org)
 
+Hardened VPN ProxyVM tooling for Qubes OS using `nftables`.
 
-### Features
-* Provides a **fail closed**, antileak VPN tunnel environment
-* Isolates the tunnel client within a dedicated Proxy VM
-* Prevents configuration errors
-* Separate firewall VM not required
+This codebase turns a Qubes ProxyVM into a fail-closed VPN gateway for downstream VMs. Its primary design goal is simple:
 
-### Easy setup
-* Simple install script; No file editing or IP numbers necessary
-* Lets you 'drop in' configuration files from VPN service provider
-* Flexible installation into template or to individual ProxyVMs
+- downstream VMs must not reach clearnet before the VPN is up
+- downstream VMs must not bypass the VPN while it is up
+- downstream VMs must lose connectivity again if the VPN goes down
+- DNS from downstream VMs must be redirected to VPN-provided DNS only
+- IPv6 must be disabled, not “supported carefully”
 
----
+The current implementation targets modern Qubes networking with `nftables` and is intended for Debian 13 and current Fedora templates used with Qubes OS 4.3.
 
-Quickstart setup guide
----
+## Tested Versions
 
-1. Create a ProxyVM using a template with VPN/tunnel software installed (i.e. OpenVPN). (In Qubes 4.0 a proxyVM is called an 'AppVM' with the `provides network` option enabled; this document will use the more descriptive 'ProxyVM' term...)
+Last explicitly observed working combination during this work:
 
-   Make a choice for the networking/netvm setting, such as `sys-net`.
+- Qubes OS: 4.3.0
+- Template: `debian-13-minimal` from the Qubes repository
+- Firewall backend: `nftables`
+- OpenVPN: 2.6.14
 
-   Next, add `vpn-handler-openvpn` to the ProxyVM's Settings / Services tab by
-typing it into the top line and clicking the _plus_ icon. Do not add other network
-services such as Network Manager.
+Version information that matters for this repository:
 
-2. Copy the VPN config files from your service provider to the ProxyVM's '/rw/config/vpn' folder, then copy or link the desired config to 'vpn-client.conf':
+- Qubes OS release, because firewall internals and helper paths can change across major releases
+- Template distribution and version, because package names and helper availability differ between Debian and Fedora
+- VPN backend and version, because OpenVPN and WireGuard interact with hooks and routing differently
+- `nftables`-based Qubes firewall model, because this repository no longer targets the legacy `iptables` path
 
-   ```
-   sudo mkdir -p /rw/config/vpn
-   cd /rw/config/vpn
-   sudo unzip ~/ovpn-configs-example.zip
-   sudo cp US_East.ovpn vpn-client.conf
-   ```
+## Fundamental Changes From The Original Project
 
-   Note: This is a good point to test the connection. See the _Link Testing_ section below for tips.
+This repository no longer behaves like the older upstream `iptables`-based implementation. The most important changes are architectural, not cosmetic.
 
-3. Decide whether you want a template or ProxyVM-only installation. Copy the Qubes-vpn-support folder to the template or Proxy VM, then run install. You will be prompted for your VPN login credentials either in this step (ProxyVM) or next step (template):
+### Firewall Backend
 
-   ```
-   cd Qubes-vpn-support
-   sudo bash ./install
-   ```
+Original project behavior:
 
-4. If installed to a template, shutdown the templateVM then start the ProxyVM and finish setup with:
+- legacy `iptables` / `ip6tables`
+- more reliance on older helper paths and older Qubes assumptions
 
-   ```
-   sudo /usr/lib/qubes/qubes-vpn-setup --config
-   ```
+Current behavior:
 
-Restart the ProxyVM. This will autostart the VPN client and you should see a popup notification 'LINK IS UP'!
+- `nftables` only
+- direct integration with the Qubes `qubes` table and custom chains
+- explicit startup validation of the installed firewall state
 
-Regular usage is simple: Just link other VMs to the VPN VM and start them!
+### IPv6 Policy
 
-### Updating from prior versions
+Original project behavior:
 
-Download the new Qubes-vpn-support release from github to your VM as before, then run the `sudo bash ./install` command to reinstall. In a ProxyVM, username/password entry is performed last and can be skipped by pressing
-Ctrl-C at the prompt. The updated VMs should then be shut down or restarted.
+- attempted IPv6 anti-leak handling while still supporting some IPv6 logic
 
-### Locating and downloading VPN config files
+Current behavior:
 
-VPN configuration files are usually available from the VPN provider's support,
-download or account pages as "Linux openvpn" or "Linux wireguard".
-If they offer an "App", do not download this as it
-won't work with Qubes-vpn-support.
+- IPv6 is intentionally disabled
+- kernel IPv6 knobs are forced off
+- IPv6 forward/input/output paths are dropped
+- IPv6 DNS and IPv6 endpoints are rejected in strict mode
 
-Config download pages for popular VPN providers:
-* [Mullvad](https://mullvad.net/en/account/#/openvpn-config/) (choose platform: Linux)
-* [NordVPN](https://nordvpn.com/tutorials/linux/openvpn)
+### Forwarding Policy
 
----
+Original project behavior:
 
-Technical notes
----
+- downstream anti-leak relied more heavily on inherited Qubes behavior
+- reverse flow handling was less explicit
 
-### Operating system support
+Current behavior:
 
-Qubes-vpn-support is tested to run on Fedora 30, Debian 9 and 10 template-based VMs
-under Qubes OS 4.0.1. It is further tested to operate in tandem with
-[Whonix](https://www.whonix.org) gateway VMs to tunnel Tor traffic and/or tunnel over Tor.
+- downstream traffic is allowed only from interface group `2` to VPN group `9`
+- return traffic from the VPN side is allowed only for `ct state established,related`
+- downstream traffic to the upstream interface group is explicitly dropped
 
+### DNS Handling
+
+Original project behavior:
+
+- downstream DNS redirection existed, but relied on older helper assumptions
+- hostname handling before tunnel establishment was less strict
+
+Current behavior:
+
+- downstream DNS DNAT is installed only after VPN link-up
+- VPN startup fails closed if strict DNS information is missing
+- OpenVPN `remote` hostnames are pre-resolved through configured VPN DNS
+- WireGuard `Endpoint` hostnames are pre-resolved through configured VPN DNS
+- Qubes virtual DNS is read from `/var/run/qubes/qubes-ns` when available and from QubesDB on current Qubes 4.3 templates
+
+### Service Lifecycle
+
+Original project behavior:
+
+- the service could start before a real `vpn-client.conf` existed
+- first-run firewall timing was more fragile
+
+Current behavior:
+
+- the service requires `/rw/config/vpn/vpn-client.conf`
+- the Qubes firewall service is reloaded when the local firewall hook is installed
+- the startup firewall check uses semantic `nft -j` parsing instead of brittle text matching
+
+### Configuration Workflow
+
+Original project behavior:
+
+- setup assumed a more immediate “install and configure everything now” flow
+
+Current behavior:
+
+- staged deployment is supported
+- install first, configure the ProxyVM, then add config/certs/userpass later
+- `--userpass` allows credentials to be added after initial setup
+- dependency checking is built into the installer and is distro-aware
+
+### Backend Support
+
+Original project behavior:
+
+- OpenVPN was the main path
+- WireGuard support was more limited and less aligned with the current firewall model
+
+Current behavior:
+
+- OpenVPN is the primary supported path
+- WireGuard is supported through override hooks, but remains more operationally sensitive than OpenVPN
+
+## Why This Is In README Instead Of Only A Changelog
+
+A changelog is still useful for release-by-release history, but it is not enough for this transition.
+
+The differences here affect:
+
+- threat model
+- firewall semantics
+- DNS resolution behavior
+- deployment workflow
+- runtime assumptions about modern Qubes OS
+
+That makes a README architecture/delta section the right place for the explanation. If release discipline becomes important later, a separate `CHANGELOG.md` can summarize versioned milestones while this section explains the design-level differences.
+
+## Official References
+
+The Qubes-specific assumptions in this repository are based on the following official Qubes OS documentation:
+
+- Qubes firewall documentation:
+  https://doc.qubes-os.org/en/latest/user/security-in-qubes/firewall.html
+- Qubes OS 4.3 release notes:
+  https://doc.qubes-os.org/en/latest/developer/releases/4_3/release-notes.html
+- Debian template documentation:
+  https://doc.qubes-os.org/en/latest/user/templates/debian/debian.html
+
+## Non-official References
+
+The implementation port and compatibility review also used upstream project materials from the original repository:
+
+- Upstream project repository:
+  https://github.com/tasket/Qubes-vpn-support
+- Discussion referenced by the user about the `nftables` patch direction:
+  https://github.com/tasket/Qubes-vpn-support/pull/71
+- Upstream `replace-iptables-with-nftables` branch:
+  https://github.com/tasket/Qubes-vpn-support/tree/replace-iptables-with-nftables
+- Upstream commit introducing the `nftables` migration:
+  https://github.com/tasket/Qubes-vpn-support/commit/d05c0f1
+- Upstream commit refining DNS handling on the `nftables` line:
+  https://github.com/tasket/Qubes-vpn-support/commit/4141e94
+
+These non-official references were used to understand upstream intent and to port project-local behavior into this repository. They were not used as authority for Qubes OS behavior itself.
+
+## What This Code Does
+
+At install time, the project installs a systemd service and helper scripts into a TemplateVM or directly into a ProxyVM.
+
+At runtime, it does the following inside the VPN ProxyVM:
+
+- adds a restrictive `nftables` profile on top of Qubes' own `qubes` table/chains
+- disables IPv6 through kernel sysctls and drops IPv6 in firewall chains
+- blocks downstream forwarding to the upstream network interface group
+- allows downstream forwarding only to the VPN tunnel interface group
+- allows reverse VPN-to-downstream forwarding only for `ct state established,related`
+- restricts upstream egress from the ProxyVM itself to the VPN process group
+- redirects downstream DNS to VPN DNS only after the link is up
+- refuses to continue if VPN DNS is missing in strict mode
+- resolves OpenVPN `remote` hostnames and WireGuard `Endpoint` hostnames against configured VPN DNS before starting the client
+- tags the active VPN interface into link group `9`, which becomes the only allowed downstream egress path
+- resolves Qubes virtual DNS addresses from `/var/run/qubes/qubes-ns` when available and falls back to QubesDB (`/qubes-netvm-primary-dns`, `/qubes-netvm-secondary-dns`) on Qubes OS 4.3 environments where the legacy helper file is absent
+
+The end result is an in-VM enforcement model built for Qubes' network topology rather than a generic Linux laptop VPN setup.
+
+## Security Model
+
+This project assumes:
+
+- Qubes OS manages the base `qubes` firewall table and interface groups
+- the ProxyVM uses the normal Qubes networking model and a default `sys-firewall`
+- the operator wants stronger local restrictions inside the VPN ProxyVM, not less
+
+This project does not claim mathematically perfect leakproof behavior. It is designed to fail closed, but the final security claim still depends on runtime verification on the target Qubes release, template, and VPN provider configuration.
+
+The important design choices are:
+
+- explicit `nftables` rules over legacy `iptables`
+- explicit conntrack return handling rather than broad reverse forwarding
+- IPv6 removal instead of mixed IPv4/IPv6 policy complexity
+- delayed DNS redirection until VPN DNS is known
+- hostname resolution pinned to configured VPN DNS where supported
+
+## Technologies Used
+
+- `systemd` for lifecycle management
+- `nftables` for packet filtering and DNS DNAT
+- Qubes OS `qubes-firewall.d` integration
+- Qubes interface grouping (`iifgroup` / `oifgroup`)
+- Linux conntrack (`ct state established,related`)
+- OpenVPN `up`/`down` hooks
+- WireGuard `wg-quick` override hooks
+- `notify-send` and `xterm` for operator prompts and status messages
+
+## File Map
+
+- `install`
+  Thin wrapper that enters `files-main` and runs the installer.
+- `files-main/proxy-firewall-restrict`
+  Main `nftables` hardening script applied by Qubes firewall hooks.
+- `files-main/qubes-vpn-setup`
+  Installer, dependency checker, lifecycle helper, and runtime validator.
+- `files-main/qubes-vpn-ns`
+  DNS translation logic for downstream VMs after the link comes up.
+- `files-main/qubes-vpn-openvpn-script`
+  OpenVPN helper that runs the DNS hook and assigns the tunnel interface to group `9`.
+- `files-main/qubes-vpn-handler.service`
+  Systemd service for the VPN client.
+- `files-main/qubes-vpn-handler.service.d/10_wg.conf.example`
+  Example override for WireGuard via `wg-quick`.
+- `files-main/vpn/vpn-client.conf-example`
+  Example OpenVPN config with strict DNS notes.
+
+## Firewall Behavior
+
+The firewall profile is layered on top of Qubes' own `qubes` table.
+
+IPv4 forwarding policy:
+
+- drop downstream traffic to upstream: `oifgroup 1 drop`
+- drop upstream traffic to downstream unless stateful return rule matches: `iifgroup 1 drop`
+- allow new downstream traffic only from downstream group `2` to VPN group `9`
+- allow VPN-to-downstream traffic only when `ct state established,related`
+
+IPv6 policy:
+
+- IPv6 is disabled in kernel sysctls
+- IPv6 forward/input/output paths are dropped in firewall chains
+- IPv6 endpoints and DNS values are rejected in strict mode
+
+ProxyVM egress policy:
+
+- loopback is allowed
+- upstream egress is allowed only for traffic running as group `qvpn`
+- this is strongest for userspace VPNs like OpenVPN
+
+## DNS Behavior
+
+Strict DNS handling is part of the threat model.
+
+For downstream VMs:
+
+- before VPN up: no DNS DNAT rules are installed
+- after VPN up: downstream DNS to Qubes virtual DNS is DNATed to VPN DNS
+- if VPN DNS is absent: the link hook fails closed
+- the Qubes virtual DNS addresses are sourced from the legacy helper file when present, otherwise from QubesDB on current Qubes 4.3 templates
+
+For hostname resolution before the tunnel exists:
+
+- OpenVPN `remote hostname` entries are rewritten to IPv4 addresses resolved through `setenv vpn_dns`
+- WireGuard `Endpoint = hostname:port` entries are rewritten to IPv4 addresses resolved through `DNS =`
+
+This avoids relying on ordinary pre-tunnel resolver state for endpoint lookup when a hostname is used.
+
+## OpenVPN and WireGuard
 
 ### OpenVPN
-* The OpenVPN version tested here is 2.4.x.
 
-* It is assumed that 'tun' mode will be used by the VPN as this is by far the most common. The 'tap' mode may work, however it is currently untested.
+OpenVPN is the stronger fit for this design because it is a userspace client and the ProxyVM egress rule can restrict upstream access to the VPN process group directly.
 
-* Routing details are determined by the VPN provider and can be viewed in the service log if required for troubleshooting. They will appear as references to "route" and "gateway".
+Recommended practice:
 
-### Wireguard VPN
-* Experimental support for wireguard has been added. See the
-wiki [for directions](https://github.com/tasket/Qubes-vpn-support/wiki/Wireguard-VPN-connections-in-Qubes-OS)
-that include specific installation steps for wireguard in Debian along with Qubes-vpn-support.
+- use `tun`
+- use `remote-cert-tls server`
+- provide `setenv vpn_dns "X.X.X.X Y.Y.Y.Y"` when `remote` uses a hostname
+- provide `remote` as an IPv4 address if you want to avoid pre-connect DNS entirely
 
-### Link Testing and Troubleshooting
+### WireGuard
 
-* Connections should be manually tested with a command like `sudo openvpn --cd  /rw/config/vpn --config vpn-client.conf --auth-user-pass userpassword.txt` _before_ the script 'install' step. This is a good idea because
-it shows whether or not the basic link is working before Qubes-specific scripts
-become a factor.
+WireGuard is supported through the included `wg-quick` override example, but it is not identical to OpenVPN from a policy-enforcement perspective.
 
-* After script installation, service commands such as `systemctl status qubes-vpn-handler` and `journalctl` may be used to monitor and troubleshoot connections started by the qubes-vpn-handler service.
+Important differences:
 
-* For manual DNS testing you can set DNS addresses in a CLI with:
-  ```
-  # Use 'up' for downstream VMs or 'test-up' for internal proxyVM tests
-  sudo env vpn_dns="<dnsaddress1> <dnsaddress2>" /usr/lib/qubes/qubes-vpn-ns up
-  ```
+- WireGuard traffic is kernel-driven rather than a userspace socket owned by the VPN process
+- the project therefore relies on the WireGuard override flow to mark the tunnel interface and install DNS hooks
+- strict hostname handling for WireGuard requires `DNS =` to be set in the config when `Endpoint` uses a hostname
+- for the strongest and simplest deployment, use an IPv4 `Endpoint` address instead of a hostname
 
-  Similarly, you can use `vpn_dns` to permanently override the DNS that your provider assigns. For openvpn use `setenv` in the config file like this:
-  ```
-  setenv vpn_dns 'dnsaddress1 dnsaddress2'
+Functional status:
 
-  ```
+- OpenVPN: first-class path
+- WireGuard: supported, but more operationally sensitive and still best treated as experimental compared to OpenVPN
 
-* You should be able to use `ping` and `traceroute` commands from a downstream AppVM without
-issue after connecting. However, doing so from inside the VPN VM requires granting special
-permission to the network with `sudo sg qvpn "command"`. (Also see *Firewall notes* for other
-ways to permit outbound traffic.)
+## Dependency Checks
 
-* Users have occasionally reported openvpn being unable to perform DNS lookups for the VPN provider's domain.
-This may be due to the way Qubes passes DNS requests up through various netvm layers on their way to
-the upstream network. Some workarounds that may improve DNS access are: 1. Populating /etc/resolv.conf with
-the DNS address of your physical ISP; 2. Installing the `resolvconf` package; 3. Enabling egress as described
-in the Firewall notes below.
+`qubes-vpn-setup` now includes a distro-aware dependency checker:
 
-### Tor/Whonix notes
-Qubes-vpn-support can handle either Tor-over-VPN (configuring sys-whonix `netvm` setting to use VPN VM) or the reverse, VPN-over-Tor (configuring VPN VM `netvm` setting to use sys-whonix). The latter requires the VPN client to be configured for TCP instead of UDP protocol, and a different port number such as 443 may be required by your VPN provider; For openvpn this can all be specified with the `remote` directive in the config file.
+```bash
+sudo /usr/lib/qubes/qubes-vpn-setup --check-deps
+```
 
-### Using clients other than OpenVPN
-The main issue with using another client is how you run it. In most cases, adding a conf file under qubes-vpn-handler.d to change the relevant variables and options should be sufficient. An experimental conf for wireguard is included and can be activated by removing '.example' from the filename; it has been tested with Mullvad.net.
+It currently checks for:
 
-Passing the DNS addresses to `qubes-vpn-ns` is another issue: If your client doesn't automatically pass `foreign_option` vars in the same format as openvpn, then on connection set the `vpn_dns` environment variable to one or more DNS addresses separated by a space. In the wireguard example this is accomplished by adding override functions to `wg-quick`.
+- Qubes networking agent package
+- `nftables`
+- `python3`
+- `xterm`
+- notification support package (`libnotify-bin` on Debian, `libnotify` on Fedora)
+- `openvpn`
+- `wireguard-tools`
 
-Since it is the job of a VPN vendor to focus tightly on __link__ security, you should be wary of VPN clients that manipulate iptables or nftables in an attempt to secure the system's communications profile (i.e. prevent leaks); they probably don't take Qubes' unusual network topology into account in which case anti-leak would fail. Normally, security should be added to a VPN setup from the OS or specialty scripts (like these) or by the admins and users themselves. An exception to this is the LEAP bitmask client, which alters iptables with its own anti-leak rules that account for Qubes.
+The installer runs this check automatically and stops if required packages are missing.
 
-### Link security
-A secure VPN service will use a certificate configuration, usually meaning `remote-cert-tls` is used in the openvpn config; This is the best way to protect against MITM attacks and ensure you are really connecting to your VPN service provider. Conversely, restricting access to particular addresses via the firewall is probably not going to substantially improve link security as IP addresses can be spoofed by an attacker.
+## Staged Deployment
 
-### Firewall notes
-The `proxy-firewall-restrict` script builds on the internal rules already set by Qubes firewall in a Proxy VM, and puts the VM in a very locked-down state for networking.
+The codebase now supports staging configuration after AppVM creation.
 
-On Qubes 4.x this script is linked to /rw/config/qubes-firewall.d/90_tunnel-restrict and you can add a custom script in the qubes-firewall.d folder to include your own rules.
+This means you can:
 
-For userspace VPN protocols such as OpenVPN, traffic originating from the VPN VM is controlled by group ID of the
-running process; only `qvpn` group is granted access. However, this restriction can be safely removed if necessary as it exists only to prevent accidental clearnet access from within the VPN VM and does not affect anti-leak rules for connected downstream VMs. Enable the Qubes service 'vpn-handler-egress' for the VPN VM to disable this group restriction.
+1. install the package in the TemplateVM
+2. create the ProxyVM
+3. run `--config` in the ProxyVM
+4. add `vpn-client.conf`, certs, keys, and optional user/password later
+5. start the service only after the config actually exists
 
-ICMP packets are allowed for local traffic by default. If you think blocking ICMP is necessary you can enable
-the Qubes service 'vpn-handler-no-icmp'. Note this does not affect downstream VM (forwarded) ICMP traffic; blocking this
-can be done with the `qvm-firewall` tool.
+The service now requires `/rw/config/vpn/vpn-client.conf`, so it will not loop pointlessly before configuration has been added.
 
+To add username/password later:
 
-### Basic concepts
+```bash
+sudo /usr/lib/qubes/qubes-vpn-setup --userpass
+```
 
-* The VPN VM is generally trusted. It is assumed its other programs won't try to impersonate openvpn (send data via port 1194), for example.
-* Everything outside the VPN VM and VPN server is essentially untrusted (from the VPN client's point of view): This means the sys-net, local router or Wifi access point, ISP and downstream VMs are potential threats. (This doesn't affect the users POV of whether individual appVMs or sites are trusted.)
-* Everything that is downstream from VPN VM communicates through the VPN tunnel only.
-* The purpose of the programs in the VPN VM is to support the creation of the VPN link. Their net access is either null or clearnet only; they should not send packets through the VPN tunnel and potentially get published.
-* Configuration of the VPN client details (server address, protocols, etc) should be downloaded from the VPN provider's support page; the user can simply drop the config file into the /rw/config/vpn folder and rename it.
+## Notifications and Operator UX
 
-### Releases
+This project currently uses:
 
-v1.4.4, Dec. 2020:
-  * Workaround for notification jam at start
+- `notify-send` for status popups
+- `xterm` for credential prompts when needed
 
-v1.4.3, July 2019:
-  * Misc compatibility fixes
-  * Fix password character handling
-  
-v1.4.1, June 2019:
-  * Qubes 4.0.1 support
-  * Control over specific firewall restrictions
-  * Better compatibility with MTU fragmentation detection
+For notification support in a TemplateVM, this project checks for the package that provides `notify-send`, but actual display still depends on the template having a desktop session capable of showing notifications. Full Debian/Fedora templates are a better fit than minimal templates.
 
-v1.4.0, Jan. 2019:
-  * Anti-leak for IPv6
-  * All DNS requests forced to chosen VPN DNS
-  * Firewall integrity checked before connecting
-  * Quicker re-connection
-  * Supports passwordless cert authentication
+Observed behavior on Qubes 4.3:
 
-v1.3 beta, July 2017
+- direct `notify-send` testing may report a notifier service problem depending on the session state
+- service-triggered notifications can still appear during actual VPN lifecycle events such as `Ready to start link` and `LINK IS UP`
 
-v1.0.2, June 2016
+So notification testing should be treated as a runtime/session concern, not a reliable indicator that the VPN hook path itself has failed.
 
-### Donations
-* <a href="https://liberapay.com/tasket/donate"><img alt="Donate with Liberapay" src="images/lp_donate.svg" height=54></a>
-* <a href="https://www.patreon.com/tasket"><img alt="Donate with Patreon" src="images/become_a_patron_button.png" height=50></a>
+## Verification
 
-If you like Qubes-vpn-support or my other efforts, monetary contributions are welcome and can
-be made through [Liberapay](https://liberapay.com/tasket/donate)
-or [Patreon](https://www.patreon.com/tasket).
+See:
 
-### See also:
-[OpenVPN documentation](https://openvpn.net/index.php/open-source/documentation.html)
+- [Qubes 4.3 Firewall Verification](docs/QUBES_4_3_FIREWALL_VERIFICATION.md)
+- [ProxyVM Template Quickstart](docs/PROXYVM_TEMPLATE_QUICKSTART.md)
 
-[Whonix - Tor networking in Qubes](https://www.qubes-os.org/doc/whonix/install/)
+Those documents include more specific citations placed next to the verification and deployment procedures they support.
 
-[Qubes VM hardening](https://github.com/tasket/Qubes-VM-hardening)
+## Command Summary
 
-[Wyng incremental backup](https://github.com/tasket/Qubes-VM-hardening)
+```bash
+sudo bash ./install
+sudo /usr/lib/qubes/qubes-vpn-setup --check-deps
+sudo /usr/lib/qubes/qubes-vpn-setup --config
+sudo /usr/lib/qubes/qubes-vpn-setup --userpass
+sudo systemctl restart qubes-vpn-handler.service
+sudo systemctl status qubes-vpn-handler.service
+sudo journalctl -u qubes-vpn-handler.service -b
+```
