@@ -12,6 +12,49 @@ This codebase turns a Qubes ProxyVM into a fail-closed VPN gateway for downstrea
 
 The current implementation targets modern Qubes networking with `nftables` and is intended for Debian 13 and current Fedora templates used with Qubes OS 4.3.
 
+## Install Quickstart
+
+Use this section for the short path. For the full deployment walkthrough, see [ProxyVM Template Quickstart](docs/PROXYVM_TEMPLATE_QUICKSTART.md).
+
+In the TemplateVM:
+
+```bash
+cd Qubes-vpn-support
+sudo bash ./install
+```
+
+Shut down the TemplateVM, create a VPN ProxyVM from it, enable `provides network`, and start the ProxyVM.
+
+In the VPN ProxyVM:
+
+```bash
+sudo /usr/lib/qubes/qubes-vpn-setup --config
+sudo mkdir -p /rw/config/vpn
+```
+
+Add provider files to `/rw/config/vpn/`, including:
+
+- `vpn-client.conf`
+- required certs, keys, and CRLs
+- optional username/password via `sudo /usr/lib/qubes/qubes-vpn-setup --userpass`
+
+Then start the handler:
+
+```bash
+sudo systemctl restart qubes-firewall.service
+sudo systemctl restart qubes-vpn-handler.service
+sudo systemctl status qubes-vpn-handler.service
+```
+
+Verify before attaching downstream VMs:
+
+```bash
+ip -br link
+sudo nft list chain ip qubes custom-forward
+sudo nft list chain ip qubes dnat-dns
+cat /var/run/qubes/qubes-vpn-ns
+```
+
 ## Tested Versions
 
 Last explicitly observed working combination during this work:
