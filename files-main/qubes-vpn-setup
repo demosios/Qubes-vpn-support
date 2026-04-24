@@ -126,11 +126,16 @@ disable_ipv6_stack() {
 
 install_wireguard_override() {
     local target_root="$1"
+    local template_root="${2:-/lib/systemd/system}"
     local dropin_dir="$target_root/qubes-vpn-handler.service.d"
     local example_conf="$dropin_dir/10_wg.conf.example"
     local live_conf="$dropin_dir/10_wg.conf"
+    local template_conf="$template_root/qubes-vpn-handler.service.d/10_wg.conf.example"
 
-    [ -d "$dropin_dir" ] || return 0
+    mkdir -p "$dropin_dir"
+    if [ ! -f "$example_conf" ] && [ -f "$template_conf" ]; then
+        cp -a "$template_conf" "$example_conf"
+    fi
     [ -f "$example_conf" ] || return 0
     cp -a "$example_conf" "$live_conf"
     echo "Installed WireGuard override at $live_conf"
@@ -147,9 +152,13 @@ sync_wireguard_override() {
     local source_root="${1:-/rw/config}"
     local target_root="${2:-/lib/systemd/system}"
     local source_live_conf="$source_root/qubes-vpn-handler.service.d/10_wg.conf"
+    local target_dropin_dir="$target_root/qubes-vpn-handler.service.d"
+    local target_live_conf="$target_dropin_dir/10_wg.conf"
 
     if [ -f "$source_live_conf" ]; then
-        install_wireguard_override "$target_root"
+        mkdir -p "$target_dropin_dir"
+        cp -a "$source_live_conf" "$target_live_conf"
+        echo "Installed WireGuard override at $target_live_conf"
     else
         remove_wireguard_override "$target_root"
     fi
@@ -163,7 +172,7 @@ prompt_wireguard_override() {
 
     case "$answer" in
         y|Y|yes|YES|Yes)
-            install_wireguard_override /rw/config
+            install_wireguard_override /rw/config /lib/systemd/system
             ;;
         *)
             remove_wireguard_override /rw/config
