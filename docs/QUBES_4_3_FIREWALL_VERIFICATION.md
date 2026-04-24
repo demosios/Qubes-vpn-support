@@ -124,6 +124,9 @@ Before `vpn-client.conf` exists:
 
 ```bash
 systemctl status qubes-vpn-handler.service
+# WireGuard uses:
+# systemctl status qubes-wg-handler.service
+ls -l /rw/config/vpn/backend-openvpn /rw/config/vpn/backend-wireguard
 ```
 
 The service should not start because the unit now requires:

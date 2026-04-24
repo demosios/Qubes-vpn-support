@@ -98,17 +98,54 @@ check_dependencies() {
 }
 
 print_config_staging_notes() {
+    local backend="${1:-openvpn}"
+    local service_name="qubes-vpn-handler.service"
+    local dns_hint='OpenVPN: setenv vpn_dns "X.X.X.X Y.Y.Y.Y"'
+
+    if [ "$backend" = "wireguard" ]; then
+        service_name="qubes-wg-handler.service"
+        dns_hint='WireGuard: DNS = X.X.X.X, Y.Y.Y.Y'
+    fi
+
     cat <<'EOF'
 Next steps:
 1. Put your VPN configuration in /rw/config/vpn/vpn-client.conf.
 2. Add any provider certs/keys to /rw/config/vpn/.
+EOF
+    if [ "$backend" = "openvpn" ]; then
+        cat <<'EOF'
 3. If the config uses username/password auth, run:
    sudo /usr/lib/qubes/qubes-vpn-setup --userpass
+EOF
+    fi
+    cat <<EOF
 4. For strict hostname resolution, set VPN DNS inside the config:
-   OpenVPN: setenv vpn_dns "X.X.X.X Y.Y.Y.Y"
-   WireGuard: DNS = X.X.X.X, Y.Y.Y.Y
-5. Start or restart the service after the config exists:
-   sudo systemctl restart qubes-vpn-handler.service
+   $dns_hint
+5. Start or restart the selected service after the config exists:
+   sudo systemctl restart $service_name
+EOF
+}
+
+print_config_success_notes() {
+    local backend="${1:-openvpn}"
+    local marker_path="$qvpnpath/backend-openvpn"
+    local service_name="qubes-vpn-handler.service"
+    local command_name="--config-openvpn"
+
+    if [ "$backend" = "wireguard" ]; then
+        marker_path="$qvpnpath/backend-wireguard"
+        service_name="qubes-wg-handler.service"
+        command_name="--config-wireguard"
+    fi
+
+    cat <<EOF
+Configuration completed successfully for $backend.
+Verified by this command:
+  sudo /usr/lib/qubes/qubes-vpn-setup $command_name
+Persistent backend marker:
+  $marker_path
+Selected service:
+  $service_name
 EOF
 }
 
@@ -122,63 +159,6 @@ disable_ipv6_stack() {
         [ -e "$knob" ] || continue
         echo '1' > "$knob"
     done
-}
-
-install_wireguard_override() {
-    local target_root="$1"
-    local template_root="${2:-/lib/systemd/system}"
-    local dropin_dir="$target_root/qubes-vpn-handler.service.d"
-    local example_conf="$dropin_dir/10_wg.conf.example"
-    local live_conf="$dropin_dir/10_wg.conf"
-    local template_conf="$template_root/qubes-vpn-handler.service.d/10_wg.conf.example"
-
-    mkdir -p "$dropin_dir"
-    if [ ! -f "$example_conf" ] && [ -f "$template_conf" ]; then
-        cp -a "$template_conf" "$example_conf"
-    fi
-    [ -f "$example_conf" ] || return 0
-    cp -a "$example_conf" "$live_conf"
-    echo "Installed WireGuard override at $live_conf"
-}
-
-remove_wireguard_override() {
-    local target_root="$1"
-    local live_conf="$target_root/qubes-vpn-handler.service.d/10_wg.conf"
-
-    rm -f "$live_conf"
-}
-
-sync_wireguard_override() {
-    local source_root="${1:-/rw/config}"
-    local target_root="${2:-/lib/systemd/system}"
-    local source_live_conf="$source_root/qubes-vpn-handler.service.d/10_wg.conf"
-    local target_dropin_dir="$target_root/qubes-vpn-handler.service.d"
-    local target_live_conf="$target_dropin_dir/10_wg.conf"
-
-    if [ -f "$source_live_conf" ]; then
-        mkdir -p "$target_dropin_dir"
-        cp -a "$source_live_conf" "$target_live_conf"
-        echo "Installed WireGuard override at $target_live_conf"
-    else
-        remove_wireguard_override "$target_root"
-    fi
-}
-
-prompt_wireguard_override() {
-    local answer
-
-    printf 'Install WireGuard systemd override? [y/N]: '
-    read -r answer || answer=""
-
-    case "$answer" in
-        y|Y|yes|YES|Yes)
-            install_wireguard_override /rw/config /lib/systemd/system
-            ;;
-        *)
-            remove_wireguard_override /rw/config
-            echo "Using default OpenVPN service settings."
-            ;;
-    esac
 }
 
 is_ipv4_literal() {
@@ -381,6 +361,109 @@ reload_qubes_firewall() {
     systemctl restart qubes-firewall.service
 }
 
+set_backend_marker() {
+    local backend="$1"
+
+    mkdir -p "$qvpnpath"
+    rm -f "$qvpnpath/backend-openvpn" "$qvpnpath/backend-wireguard"
+    touch "$qvpnpath/backend-$backend"
+}
+
+select_backend_service() {
+    local backend="$1"
+    local start_service
+
+    case "$backend" in
+        openvpn)
+            start_service="qubes-vpn-handler.service"
+            ;;
+        wireguard)
+            start_service="qubes-wg-handler.service"
+            ;;
+        *)
+            echo "Error: unsupported backend $backend" >&2
+            return 1
+            ;;
+    esac
+
+    set_backend_marker "$backend"
+    systemctl daemon-reload
+    systemctl stop qubes-vpn-handler.service qubes-wg-handler.service >/dev/null 2>&1 || true
+    systemctl start "$start_service" >/dev/null 2>&1 || true
+    echo "Selected backend: $backend"
+}
+
+require_vpn_config() {
+    if [ ! -f $qvpnpath/vpn-client.conf ]; then
+        echo "Error: missing $qvpnpath/vpn-client.conf" >&2
+        echo "Add the VPN config and restart the selected service." >&2
+        exit 1
+    fi
+}
+
+prepare_wireguard_helper() {
+    local wg_quick_bin
+
+    wg_quick_bin="$(command -v wg-quick || true)"
+    if [ -z "$wg_quick_bin" ]; then
+        echo "Error: wg-quick not found. Install wireguard-tools." >&2
+        return 1
+    fi
+
+    cp -a "$wg_quick_bin" /tmp/wg-quick
+    sed -i '/~~ function override insertion point/a set_dns() { export vpn_dns=${DNS[*]}; /usr/lib/qubes/qubes-vpn-ns up; HAVE_SET_DNS=1; }' /tmp/wg-quick
+    sed -i '/~~ function override insertion point/a unset_dns() { /usr/lib/qubes/qubes-vpn-ns down; }' /tmp/wg-quick
+}
+
+wireguard_interface_name() {
+    basename "${1:-/tmp/vpn-client.conf}" .conf
+}
+
+wireguard_up() {
+    local ifname
+
+    ifname="$(wireguard_interface_name /tmp/vpn-client.conf)"
+    /sbin/nft chain ip qubes output '{ policy accept; }'
+    /sbin/nft chain ip6 qubes output '{ policy drop; }'
+    /tmp/wg-quick up /tmp/vpn-client.conf
+    /sbin/ip link set dev "$ifname" group 9
+}
+
+wireguard_down() {
+    local wg_quick_bin="/tmp/wg-quick"
+    local config_path="/tmp/vpn-client.conf"
+
+    if [ ! -x "$wg_quick_bin" ]; then
+        wg_quick_bin="$(command -v wg-quick || true)"
+        config_path="$qvpnpath/vpn-client.conf"
+    fi
+
+    if [ -n "$wg_quick_bin" ] && [ -f "$config_path" ]; then
+        "$wg_quick_bin" down "$config_path" || true
+    fi
+    /usr/lib/qubes/qubes-vpn-ns down || true
+}
+
+run_wireguard_service() {
+    local attempt
+
+    for attempt in 1 2 3 4 5 6; do
+        resolve_remote_hostnames || true
+        if wireguard_up; then
+            break
+        fi
+
+        echo "WireGuard start attempt $attempt failed; retrying..." >&2
+        wireguard_down
+
+        if [ "$attempt" -eq 6 ]; then
+            exit 1
+        fi
+
+        sleep 10
+    done
+}
+
 check_firewall_rules() {
     python3 - <<'PY'
 import json
@@ -485,13 +568,9 @@ case "$1" in
     done
 ;;
 
---pre-start)
+--pre-start-openvpn)
     disable_ipv6_stack
-    if [ ! -f $qvpnpath/vpn-client.conf ]; then
-        echo "Error: missing $qvpnpath/vpn-client.conf" >&2
-        echo "Add the VPN config and restart qubes-vpn-handler.service." >&2
-        exit 1
-    fi
+    require_vpn_config
     if [ ! -f $qvpnpath/$upfile ] && [ ! -f $qvpnpath/no-$upfile ]; then
         if [ ! -f /tmp/qvpn-askpass ]; then
             systemd-run --unit=qvpn-askpass -E DISPLAY=:0 sh -c \
@@ -501,7 +580,6 @@ case "$1" in
     elif [ ! -f $tmppath ] && [ ! -f $qvpnpath/no-$upfile ]; then
         cp -aL $qvpnpath/$upfile $tmppath.tmp
         mv $tmppath.tmp $tmppath
-
     fi
     if [ -n "$filter_opts" ]; then
         # workaround for option parser bugs and overrides:
@@ -517,11 +595,11 @@ case "$1" in
     fi
 ;;
 
---start-exec)
+--start-openvpn)
+    resolve_remote_hostnames
     if [ -f $qvpnpath/no-$upfile ]; then
         userpassword_opt=""
     fi
-    resolve_remote_hostnames
     echo EXEC  $client_cmd $client_opt1 $client_opt2 $client_opt3 $client_opt4 \
       $client_opt5 $userpassword_opt
     eval $client_cmd $client_opt1 $client_opt2 $client_opt3 $client_opt4 \
@@ -535,7 +613,36 @@ case "$1" in
     echo "STARTED network forwarding!"
 ;;
 
---post-stop)
+--post-stop-openvpn)
+    disable_ipv6_stack
+    echo '0' > /proc/sys/net/ipv4/ip_forward
+    echo '0' > /proc/sys/net/ipv6/conf/all/forwarding
+    echo "STOPPED network forwarding!"
+;;
+
+--pre-start-wireguard)
+    disable_ipv6_stack
+    require_vpn_config
+    cp -aL $qvpnpath/vpn-client.conf /tmp
+    prepare_wireguard_helper || exit 1
+    sync
+    if [ ! -e /etc/fedora-release ]; then
+        do_notify "Ready to start WireGuard link."
+    fi
+;;
+
+--start-wireguard)
+    echo EXEC /tmp/wg-quick up /tmp/vpn-client.conf
+    run_wireguard_service
+;;
+
+--stop-wireguard)
+    wireguard_down
+;;
+
+--post-stop-wireguard)
+    firewall_link /usr/lib/qubes
+    reload_qubes_firewall
     disable_ipv6_stack
     echo '0' > /proc/sys/net/ipv4/ip_forward
     echo '0' > /proc/sys/net/ipv6/conf/all/forwarding
@@ -551,26 +658,33 @@ case "$1" in
     if [ -e /var/run/qubes/this-is-templatevm ]; then
         echo "Install into templateVM..."
         groupadd -rf qvpn
-        cp -a qubes-vpn-handler.service* /lib/systemd/system
+        cp -a qubes-vpn-handler.service qubes-wg-handler.service qubes-vpn-handler.service.d /lib/systemd/system
         sync; sleep 2s; systemctl daemon-reload
-        systemctl enable qubes-vpn-handler.service
+        systemctl enable qubes-vpn-handler.service qubes-wg-handler.service
         cp -a qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict \
     -t /usr/lib/qubes
         echo "Almost done..."
         echo "Next, shutdown this template then start proxyVM and run:"
-        echo "sudo /usr/lib/qubes/qubes-vpn-setup --config"
+        echo "sudo /usr/lib/qubes/qubes-vpn-setup --config-openvpn"
+        echo "or:"
+        echo "sudo /usr/lib/qubes/qubes-vpn-setup --config-wireguard"
 
     elif [ -e /var/run/qubes/this-is-proxyvm ]; then
         echo -n "Isolated install for proxyVM..."
-        cp -a vpn rc.local qubes-vpn-handler.* qubes-vpn-setup \
+        cp -a vpn rc.local qubes-vpn-handler.service qubes-wg-handler.service qubes-vpn-handler.service.d qubes-vpn-setup \
           qubes-vpn-ns qubes-vpn-openvpn-script proxy-firewall-restrict -t /rw/config
         firewall_link /rw/config
         reload_qubes_firewall
         ln -s -f /rw/config/qubes-vpn-setup /usr/lib/qubes/qubes-vpn-setup
         ln -s -f /rw/config/qubes-vpn-ns /usr/lib/qubes/qubes-vpn-ns
         ln -s -f /rw/config/qubes-vpn-openvpn-script /usr/lib/qubes/qubes-vpn-openvpn-script
+        systemctl daemon-reload
+        systemctl enable qubes-vpn-handler.service qubes-wg-handler.service
         echo "copy complete."
-        print_config_staging_notes
+        echo "Next choose a backend:"
+        echo "sudo /usr/lib/qubes/qubes-vpn-setup --config-openvpn"
+        echo "or:"
+        echo "sudo /usr/lib/qubes/qubes-vpn-setup --config-wireguard"
         echo "Done!"
 
     else
@@ -582,9 +696,10 @@ case "$1" in
 --uninstall)
     . /usr/lib/qubes/init/functions
     if is_templatevm ; then
-        ( systemctl stop qubes-vpn-handler.service
-        systemctl disable qubes-vpn-handler.service
+        ( systemctl stop qubes-vpn-handler.service qubes-wg-handler.service
+        systemctl disable qubes-vpn-handler.service qubes-wg-handler.service
         rm -rf /lib/systemd/system/qubes-vpn-handler.service
+        rm -rf /lib/systemd/system/qubes-wg-handler.service
         rm -rf /lib/systemd/system/qubes-vpn-handler.service.d
         systemctl daemon-reload
         cd /usr/lib/qubes
@@ -594,8 +709,10 @@ case "$1" in
     elif is_proxyvm ; then
         ( cd /rw/config
         rm -rf qubes-vpn-handler.service
+        rm -rf qubes-wg-handler.service
         rm -rf qubes-vpn-handler.service.d
         rm -f qubes-vpn-ns qubes-vpn-openvpn-script qubes-vpn-setup proxy-firewall-restrict
+        rm -f vpn/backend-openvpn vpn/backend-wireguard
         mv -v rc.local rc.local-qvpn-disabled
         )
         echo qubes-vpn-handler removed.
@@ -606,23 +723,49 @@ case "$1" in
     . /usr/lib/qubes/init/functions
     if is_proxyvm ; then
         mkdir -p /rw/config/vpn
-        prompt_wireguard_override
-        sync_wireguard_override /rw/config /lib/systemd/system
-        systemctl daemon-reload
         firewall_link /usr/lib/qubes
         reload_qubes_firewall
-        print_config_staging_notes
-        echo "Done!"
+        select_backend_service openvpn
+        print_config_staging_notes openvpn
+        print_config_success_notes openvpn
     else
         echo "Error: Not a proxyVM. Check instructions."
+    fi
+;;
+
+--config-openvpn)
+    . /usr/lib/qubes/init/functions
+    if is_proxyvm ; then
+        mkdir -p /rw/config/vpn
+        firewall_link /usr/lib/qubes
+        reload_qubes_firewall
+        select_backend_service openvpn
+        print_config_staging_notes openvpn
+        print_config_success_notes openvpn
+    else
+        echo "Error: Not a proxyVM. Check instructions."
+        exit 1
+    fi
+;;
+
+--config-wireguard)
+    . /usr/lib/qubes/init/functions
+    if is_proxyvm ; then
+        mkdir -p /rw/config/vpn
+        firewall_link /usr/lib/qubes
+        reload_qubes_firewall
+        select_backend_service wireguard
+        print_config_staging_notes wireguard
+        print_config_success_notes wireguard
+    else
+        echo "Error: Not a proxyVM. Check instructions."
+        exit 1
     fi
 ;;
 
 --config-nm)
     . /usr/lib/qubes/init/functions
     if is_proxyvm ; then
-        sync_wireguard_override /rw/config /lib/systemd/system
-        systemctl daemon-reload
         firewall_link /usr/lib/qubes
         reload_qubes_firewall
         echo "Done!"
@@ -644,10 +787,6 @@ case "$1" in
 
 --check-deps)
     check_dependencies
-;;
-
---sync-wireguard-override)
-    sync_wireguard_override "${2:-/rw/config}" "${3:-/lib/systemd/system}"
 ;;
 
 --version)

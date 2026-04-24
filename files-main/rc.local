@@ -3,13 +3,14 @@
 # Install group and scripts
 groupadd -rf qvpn
 
-if systemctl is-enabled qubes-vpn-handler.service; then
+if systemctl is-enabled qubes-vpn-handler.service || systemctl is-enabled qubes-wg-handler.service; then
     su - user -c 'notify-send --icon=dialog-warning "Using vpn-handler from template!"'
     exit 0
 fi
 
-cp -a /rw/config/qubes-vpn-handler.* /lib/systemd/system
-/rw/config/qubes-vpn-setup --sync-wireguard-override /rw/config /lib/systemd/system
+cp -a /rw/config/qubes-vpn-handler.service /lib/systemd/system
+[ -f /rw/config/qubes-wg-handler.service ] && cp -a /rw/config/qubes-wg-handler.service /lib/systemd/system
+[ -d /rw/config/qubes-vpn-handler.service.d ] && cp -a /rw/config/qubes-vpn-handler.service.d /lib/systemd/system
 sync
 ln -s -f /rw/config/qubes-vpn-ns /usr/lib/qubes/qubes-vpn-ns
 ln -s -f /rw/config/qubes-vpn-setup /usr/lib/qubes/qubes-vpn-setup
@@ -18,7 +19,8 @@ ln -s -f /rw/config/qubes-vpn-openvpn-script /usr/lib/qubes/qubes-vpn-openvpn-sc
 # Start tunnel service
 systemctl daemon-reload
 systemctl restart qubes-firewall.service
-systemctl enable qubes-vpn-handler.service
+systemctl enable qubes-vpn-handler.service qubes-wg-handler.service
 systemctl --no-block start qubes-vpn-handler.service
+systemctl --no-block start qubes-wg-handler.service
 
 exit 0

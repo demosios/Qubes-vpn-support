@@ -9,8 +9,10 @@ Description=VPN Client for Qubes proxyVM
 ConditionPathExists=!/var/run/qubes/this-is-templatevm
 ConditionPathExists=/rw/config/vpn
 ConditionPathExists=/rw/config/vpn/vpn-client.conf
-ConditionPathExistsGlob=/var/run/qubes-service/vpn-handler*
-After=network.target qubes-firewall.service rw.mount
+ConditionPathExists=/rw/config/vpn/backend-openvpn
+ConditionPathExists=/var/run/qubes-service/vpn-handler
+Wants=network-online.target
+After=network.target network-online.target qubes-firewall.service rw.mount
 Conflicts=shutdown.target
 
 [Service]
@@ -28,10 +30,10 @@ Environment="client_opt5="
 Environment="userpassword_opt=--auth-user-pass /tmp/userpassword.txt"
 
 ExecStartPre=/usr/lib/qubes/qubes-vpn-setup --check-firewall
-ExecStartPre=/usr/lib/qubes/qubes-vpn-setup --pre-start
-ExecStart=/usr/lib/qubes/qubes-vpn-setup --start-exec
+ExecStartPre=/usr/lib/qubes/qubes-vpn-setup --pre-start-openvpn
+ExecStart=/usr/lib/qubes/qubes-vpn-setup --start-openvpn
 ExecStartPost=/usr/lib/qubes/qubes-vpn-setup --post-start
-ExecStopPost=/usr/lib/qubes/qubes-vpn-setup --post-stop
+ExecStopPost=/usr/lib/qubes/qubes-vpn-setup --post-stop-openvpn
 
 
 [Install]

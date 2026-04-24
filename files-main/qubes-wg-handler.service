@@ -1,0 +1,31 @@
+##########################################################
+##  Qubes WireGuard Handler
+
+[Unit]
+Description=WireGuard Client for Qubes proxyVM
+ConditionPathExists=!/var/run/qubes/this-is-templatevm
+ConditionPathExists=/rw/config/vpn
+ConditionPathExists=/rw/config/vpn/vpn-client.conf
+ConditionPathExists=/rw/config/vpn/backend-wireguard
+ConditionPathExists=/var/run/qubes-service/vpn-handler
+Wants=network-online.target
+After=network.target network-online.target qubes-firewall.service rw.mount
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Group=qvpn
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+ExecStartPre=/usr/lib/qubes/qubes-vpn-setup --check-firewall
+ExecStartPre=/usr/lib/qubes/qubes-vpn-setup --pre-start-wireguard
+ExecStart=/usr/lib/qubes/qubes-vpn-setup --start-wireguard
+ExecStartPost=/usr/lib/qubes/qubes-vpn-setup --post-start
+ExecStop=/usr/lib/qubes/qubes-vpn-setup --stop-wireguard
+ExecStopPost=/usr/lib/qubes/qubes-vpn-setup --post-stop-wireguard
+
+[Install]
+WantedBy=multi-user.target

@@ -96,7 +96,7 @@ Create a new AppVM that:
 - uses the prepared template
 - has `provides network` enabled
 - uses your normal firewall qube as `netvm`, usually `sys-firewall`
-- has the Qubes service `vpn-handler-openvpn` enabled if you are using the shipped OpenVPN service model
+- has the Qubes service `vpn-handler` enabled if you are using the shipped service model
 
 Do not attach downstream VMs yet.
 
@@ -110,7 +110,9 @@ Reference:
 Start the new ProxyVM and run:
 
 ```bash
-sudo /usr/lib/qubes/qubes-vpn-setup --config
+sudo /usr/lib/qubes/qubes-vpn-setup --config-openvpn
+# or:
+# sudo /usr/lib/qubes/qubes-vpn-setup --config-wireguard
 ```
 
 This prepares:
@@ -118,13 +120,14 @@ This prepares:
 - `/rw/config/vpn/`
 - the Qubes firewall hook symlink
 - the local service integration
-
-It also asks whether to install the optional WireGuard systemd override.
-
-- answer `y` to install the WireGuard override
-- answer `n` or press Enter to keep the default OpenVPN service settings
+- explicit backend selection for this ProxyVM
 
 It does not require `vpn-client.conf` or credentials yet.
+
+Successful completion leaves one persistent backend marker in place:
+
+- `/rw/config/vpn/backend-openvpn`
+- `/rw/config/vpn/backend-wireguard`
 
 ## 6. Add VPN Configuration Later
 
@@ -145,13 +148,6 @@ As needed:
 - client keys
 - CRLs
 - static key files
-
-For WireGuard, `vpn-client.conf` should be a `wg-quick` style config containing at least:
-
-- `[Interface]`
-- `[Peer]`
-- `Endpoint = ...`
-- optional `DNS = ...` if you use a hostname endpoint and want strict DNS resolution
 
 ## 7. Add Authentication Later If Needed
 
@@ -181,30 +177,19 @@ Endpoint = vpn.example.net:51820
 
 For the strictest deployment, use IPv4 endpoint addresses instead of hostnames.
 
-## 9. WireGuard Path
-
-If you selected the WireGuard override during `--config`:
-
-- confirm `/rw/config/qubes-vpn-handler.service.d/10_wg.conf` exists
-- place your WireGuard `wg-quick` config at `/rw/config/vpn/vpn-client.conf`
-- if you use a hostname in `Endpoint =`, set `DNS =` to IPv4 DNS servers in the same config
-
-The persistent choice is stored in `/rw/config/qubes-vpn-handler.service.d/10_wg.conf`. On boot, `rc.local` syncs it into `/lib/systemd/system/qubes-vpn-handler.service.d/10_wg.conf`.
-
-If you did not select the override, OpenVPN takes precedence and the live `10_wg.conf` drop-in is removed.
-
-## 10. Start the Service
+## 9. Start the Service
 
 Once `vpn-client.conf` exists:
 
 ```bash
 sudo systemctl restart qubes-vpn-handler.service
 sudo systemctl status qubes-vpn-handler.service
+# WireGuard uses qubes-wg-handler.service instead.
 ```
 
 The unit now requires `/rw/config/vpn/vpn-client.conf`, so it will stay inactive until the config is actually present.
 
-## 11. Verify Before Attaching Downstream VMs
+## 10. Verify Before Attaching Downstream VMs
 
 In the ProxyVM:
 
@@ -213,6 +198,7 @@ sudo journalctl -u qubes-vpn-handler.service -b
 sudo nft list chain ip qubes custom-forward
 sudo nft list chain ip qubes dnat-dns
 cat /proc/sys/net/ipv6/conf/all/disable_ipv6
+# WireGuard uses qubes-wg-handler.service for journalctl.
 ```
 
 Verify:
@@ -222,6 +208,7 @@ Verify:
 - IPv6 is disabled
 - forwarding rules show the downstream-to-VPN allow and stateful return rule
 - `cat /var/run/qubes/qubes-vpn-ns` contains the VPN DNS values captured by the up hook
+- exactly one backend marker exists under `/rw/config/vpn/`
 
 Only then should you attach downstream AppVMs to this ProxyVM.
 
@@ -241,6 +228,6 @@ Reference:
 
 ## WireGuard Notes
 
-WireGuard no longer requires manually copying `10_wg.conf.example` into place. The supported path is to answer `y` when `sudo /usr/lib/qubes/qubes-vpn-setup --config` asks whether to install the WireGuard override.
+WireGuard now uses its own unit, `qubes-wg-handler.service`. Install once in the TemplateVM, then choose WireGuard explicitly in the ProxyVM with `--config-wireguard`.
 
 OpenVPN remains the simpler and stronger match for this project’s egress restriction model. WireGuard works, but it is more sensitive to config details and should be tested carefully before trusting it for the same operational guarantees.
