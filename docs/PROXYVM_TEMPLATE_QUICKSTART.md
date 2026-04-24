@@ -119,6 +119,11 @@ This prepares:
 - the Qubes firewall hook symlink
 - the local service integration
 
+It also asks whether to install the optional WireGuard systemd override.
+
+- answer `y` to install the WireGuard override
+- answer `n` or press Enter to keep the default OpenVPN service settings
+
 It does not require `vpn-client.conf` or credentials yet.
 
 ## 6. Add VPN Configuration Later
@@ -140,6 +145,13 @@ As needed:
 - client keys
 - CRLs
 - static key files
+
+For WireGuard, `vpn-client.conf` should be a `wg-quick` style config containing at least:
+
+- `[Interface]`
+- `[Peer]`
+- `Endpoint = ...`
+- optional `DNS = ...` if you use a hostname endpoint and want strict DNS resolution
 
 ## 7. Add Authentication Later If Needed
 
@@ -169,7 +181,19 @@ Endpoint = vpn.example.net:51820
 
 For the strictest deployment, use IPv4 endpoint addresses instead of hostnames.
 
-## 9. Start the Service
+## 9. WireGuard Path
+
+If you selected the WireGuard override during `--config`:
+
+- confirm `/rw/config/qubes-vpn-handler.service.d/10_wg.conf` exists
+- place your WireGuard `wg-quick` config at `/rw/config/vpn/vpn-client.conf`
+- if you use a hostname in `Endpoint =`, set `DNS =` to IPv4 DNS servers in the same config
+
+The persistent choice is stored in `/rw/config/qubes-vpn-handler.service.d/10_wg.conf`. On boot, `rc.local` syncs it into `/lib/systemd/system/qubes-vpn-handler.service.d/10_wg.conf`.
+
+If you did not select the override, OpenVPN takes precedence and the live `10_wg.conf` drop-in is removed.
+
+## 10. Start the Service
 
 Once `vpn-client.conf` exists:
 
@@ -180,7 +204,7 @@ sudo systemctl status qubes-vpn-handler.service
 
 The unit now requires `/rw/config/vpn/vpn-client.conf`, so it will stay inactive until the config is actually present.
 
-## 10. Verify Before Attaching Downstream VMs
+## 11. Verify Before Attaching Downstream VMs
 
 In the ProxyVM:
 
@@ -217,12 +241,6 @@ Reference:
 
 ## WireGuard Notes
 
-WireGuard is supported through the included override example:
-
-```text
-files-main/qubes-vpn-handler.service.d/10_wg.conf.example
-```
-
-Copy it into a live override with whatever naming scheme you prefer and adjust it to your deployment.
+WireGuard no longer requires manually copying `10_wg.conf.example` into place. The supported path is to answer `y` when `sudo /usr/lib/qubes/qubes-vpn-setup --config` asks whether to install the WireGuard override.
 
 OpenVPN remains the simpler and stronger match for this project’s egress restriction model. WireGuard works, but it is more sensitive to config details and should be tested carefully before trusting it for the same operational guarantees.

@@ -124,6 +124,54 @@ disable_ipv6_stack() {
     done
 }
 
+install_wireguard_override() {
+    local target_root="$1"
+    local dropin_dir="$target_root/qubes-vpn-handler.service.d"
+    local example_conf="$dropin_dir/10_wg.conf.example"
+    local live_conf="$dropin_dir/10_wg.conf"
+
+    [ -d "$dropin_dir" ] || return 0
+    [ -f "$example_conf" ] || return 0
+    cp -a "$example_conf" "$live_conf"
+    echo "Installed WireGuard override at $live_conf"
+}
+
+remove_wireguard_override() {
+    local target_root="$1"
+    local live_conf="$target_root/qubes-vpn-handler.service.d/10_wg.conf"
+
+    rm -f "$live_conf"
+}
+
+sync_wireguard_override() {
+    local source_root="${1:-/rw/config}"
+    local target_root="${2:-/lib/systemd/system}"
+    local source_live_conf="$source_root/qubes-vpn-handler.service.d/10_wg.conf"
+
+    if [ -f "$source_live_conf" ]; then
+        install_wireguard_override "$target_root"
+    else
+        remove_wireguard_override "$target_root"
+    fi
+}
+
+prompt_wireguard_override() {
+    local answer
+
+    printf 'Install WireGuard systemd override? [y/N]: '
+    read -r answer || answer=""
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            install_wireguard_override /rw/config
+            ;;
+        *)
+            remove_wireguard_override /rw/config
+            echo "Using default OpenVPN service settings."
+            ;;
+    esac
+}
+
 is_ipv4_literal() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
@@ -549,6 +597,9 @@ case "$1" in
     . /usr/lib/qubes/init/functions
     if is_proxyvm ; then
         mkdir -p /rw/config/vpn
+        prompt_wireguard_override
+        sync_wireguard_override /rw/config /lib/systemd/system
+        systemctl daemon-reload
         firewall_link /usr/lib/qubes
         reload_qubes_firewall
         print_config_staging_notes
@@ -561,6 +612,8 @@ case "$1" in
 --config-nm)
     . /usr/lib/qubes/init/functions
     if is_proxyvm ; then
+        sync_wireguard_override /rw/config /lib/systemd/system
+        systemctl daemon-reload
         firewall_link /usr/lib/qubes
         reload_qubes_firewall
         echo "Done!"
@@ -582,6 +635,10 @@ case "$1" in
 
 --check-deps)
     check_dependencies
+;;
+
+--sync-wireguard-override)
+    sync_wireguard_override "${2:-/rw/config}" "${3:-/lib/systemd/system}"
 ;;
 
 --version)

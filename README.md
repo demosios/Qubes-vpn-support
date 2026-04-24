@@ -29,8 +29,9 @@ In the VPN ProxyVM:
 
 ```bash
 sudo /usr/lib/qubes/qubes-vpn-setup --config
-sudo mkdir -p /rw/config/vpn
 ```
+
+`--config` creates `/rw/config/vpn/` for you and asks whether to install the optional WireGuard systemd override.
 
 Add provider files to `/rw/config/vpn/`, including:
 
@@ -211,7 +212,7 @@ These non-official references were used to understand upstream intent and to por
 
 ## What This Code Does
 
-At install time, the project installs a systemd service and helper scripts into a TemplateVM or directly into a ProxyVM.
+At install time, the project installs a systemd service and helper scripts into a TemplateVM, then stages persistent runtime files for the derived ProxyVM.
 
 At runtime, it does the following inside the VPN ProxyVM:
 
@@ -273,7 +274,7 @@ The important design choices are:
 - `files-main/qubes-vpn-handler.service`
   Systemd service for the VPN client.
 - `files-main/qubes-vpn-handler.service.d/10_wg.conf.example`
-  Example override for WireGuard via `wg-quick`.
+  WireGuard override template used to create a live `10_wg.conf` when selected.
 - `files-main/vpn/vpn-client.conf-example`
   Example OpenVPN config with strict DNS notes.
 
@@ -333,7 +334,7 @@ Recommended practice:
 
 ### WireGuard
 
-WireGuard is supported through the included `wg-quick` override example, but it is not identical to OpenVPN from a policy-enforcement perspective.
+WireGuard is supported through an optional `wg-quick` systemd override selected during `sudo /usr/lib/qubes/qubes-vpn-setup --config`, but it is not identical to OpenVPN from a policy-enforcement perspective.
 
 Important differences:
 
@@ -341,6 +342,13 @@ Important differences:
 - the project therefore relies on the WireGuard override flow to mark the tunnel interface and install DNS hooks
 - strict hostname handling for WireGuard requires `DNS =` to be set in the config when `Endpoint` uses a hostname
 - for the strongest and simplest deployment, use an IPv4 `Endpoint` address instead of a hostname
+
+Operational notes:
+
+- answer `y` at the `--config` prompt to install the WireGuard override
+- answer `n` or press Enter to keep the default OpenVPN service configuration
+- the persistent WireGuard selection is stored at `/rw/config/qubes-vpn-handler.service.d/10_wg.conf`
+- on boot, `rc.local` syncs that choice into `/lib/systemd/system/qubes-vpn-handler.service.d/10_wg.conf`
 
 Functional status:
 
@@ -376,10 +384,13 @@ This means you can:
 1. install the package in the TemplateVM
 2. create the ProxyVM
 3. run `--config` in the ProxyVM
-4. add `vpn-client.conf`, certs, keys, and optional user/password later
-5. start the service only after the config actually exists
+4. choose whether to install the optional WireGuard override
+5. add `vpn-client.conf`, certs, keys, and optional user/password later
+6. start the service only after the config actually exists
 
 The service now requires `/rw/config/vpn/vpn-client.conf`, so it will not loop pointlessly before configuration has been added.
+
+This means you do not need to create `/rw/config/vpn` manually before running `--config`.
 
 To add username/password later:
 
